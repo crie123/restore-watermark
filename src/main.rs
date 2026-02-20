@@ -4,6 +4,9 @@ use ttf_parser::Face;
 use std::fs;
 use std::collections::HashMap;
 use std::path::Path;
+use rand::Rng;
+use rand_chacha::ChaCha20Rng;
+use rand::SeedableRng;
 
 // ============================================
 // N-GRAM MODEL
@@ -45,6 +48,302 @@ pub fn ngram_score(text: &str, model: &NGramModel) -> f32 {
     }
 
     score
+}
+
+// ============================================
+// WATERMARK SIGNATURES
+// ============================================
+
+#[derive(Clone)]
+pub struct AxisWatermark {
+    pub lattice: Vec<f64>,
+    pub strength: f64,
+}
+
+#[derive(Clone)]
+pub struct MultiWatermark {
+    pub axes: Vec<AxisWatermark>,
+}
+
+pub fn generate_multi_watermark(
+    len: usize,
+    seeds: &[u64],
+    strength: f64,
+) -> MultiWatermark {
+    let axes = seeds
+        .iter()
+        .map(|&seed| {
+            let mut rng = ChaCha20Rng::seed_from_u64(seed);
+            let lattice = (0..len)
+                .map(|_| rng.gen_range(-1.0..1.0))
+                .collect();
+            AxisWatermark { lattice, strength }
+        })
+        .collect();
+
+    MultiWatermark { axes }
+}
+
+pub fn apply_multi_watermark(
+    signal: &mut [f64],
+    wm: &MultiWatermark,
+) {
+    for axis in &wm.axes {
+        for (v, w) in signal.iter_mut().zip(axis.lattice.iter()) {
+            *v += w * axis.strength;
+        }
+    }
+}
+
+pub fn verify_multi_watermark(
+    signal: &[f64],
+    wm: &MultiWatermark,
+) -> f64 {
+    wm.axes.iter().map(|axis| {
+        let mut corr = 0.0;
+        let mut norm = 0.0;
+
+        for (v, w) in signal.iter().zip(axis.lattice.iter()) {
+            corr += v * w;
+            norm += w * w;
+        }
+
+        corr / norm.sqrt()
+    }).sum::<f64>() / wm.axes.len() as f64
+}
+
+pub fn normalize_signal(signal: &mut [f64]) {
+    let norm = signal.iter().map(|v| v * v).sum::<f64>().sqrt();
+    if norm > 0.0 {
+        for v in signal {
+            *v /= norm;
+        }
+    }
+}
+
+pub fn verify_with_mask(
+    signal: &[f64],
+    wm: &MultiWatermark,
+    mask: &[bool],
+) -> f64 {
+    wm.axes.iter().map(|axis| {
+        let mut corr = 0.0;
+        let mut norm = 0.0;
+
+        for ((&v, &w), &m) in signal.iter()
+            .zip(axis.lattice.iter())
+            .zip(mask.iter())
+        {
+            if m {
+                corr += v * w;
+                norm += w * w;
+            }
+        }
+
+        if norm > 0.0 { corr / norm.sqrt() } else { 0.0 }
+    }).sum::<f64>() / wm.axes.len() as f64
+}
+
+// ============================================
+// SIGNAL TRANSFORMATIONS AND ATTACKS
+// ============================================
+
+pub fn add_noise(signal: &mut [f64], amplitude: f64) {
+    let mut rng = rand::thread_rng();
+    for v in signal {
+        *v += rng.gen_range(-amplitude..amplitude);
+    }
+}
+
+pub fn scale_signal(signal: &mut [f64], factor: f64) {
+    for v in signal {
+        *v *= factor;
+    }
+}
+
+pub fn crop_signal(signal: &[f64], keep_ratio: f64) -> Vec<f64> {
+    let keep = (signal.len() as f64 * keep_ratio) as usize;
+    signal[..keep].to_vec()
+}
+
+pub fn permute_signal(signal: &mut [f64]) {
+    let mut rng = rand::thread_rng();
+    use rand::seq::SliceRandom;
+    signal.shuffle(&mut rng);
+}
+
+pub fn recovery_ratio(
+    original_score: f64,
+    modified_score: f64,
+) -> f64 {
+    if original_score.abs() < 1e-6 {
+        0.0
+    } else {
+        modified_score / original_score
+    }
+}
+
+// ============================================
+// PHASE-INVARIANT WATERMARK SCORING
+// ============================================
+
+pub fn phase_invariant_score(signal: &[f64], lattice: &[f64]) -> f64 {
+    signal.iter()
+        .zip(lattice)
+        .map(|(s, v)| (s * v).powi(2))
+        .sum::<f64>()
+        .sqrt()
+}
+
+// ============================================
+// ANCHOR-AWARE WATERMARKING
+// ============================================
+
+#[derive(Clone, Debug)]
+pub struct Anchor {
+    pub text: String,
+    pub bbox_width: f64,
+    pub position: usize,
+}
+
+pub fn anchor_lattice(anchor: &Anchor, len: usize) -> Vec<f64> {
+    let freq = anchor.bbox_width / 10.0;
+    (0..len)
+        .map(|i| ((i as f64) * freq).sin())
+        .collect()
+}
+
+pub fn combined_anchor_lattice(
+    anchors: &[Anchor],
+    len: usize,
+) -> Vec<f64> {
+    let mut lattice = vec![0.0; len];
+    for a in anchors {
+        let local = anchor_lattice(a, len);
+        for i in 0..len {
+            lattice[i] += local[i];
+        }
+    }
+    lattice
+}
+
+// ============================================
+// PDF BBOX EXTRACTION
+// ============================================
+
+pub fn bbox_signal(widths: &[f64]) -> Vec<f64> {
+    let norm = widths.iter().map(|w| w * w).sum::<f64>().sqrt();
+    if norm > 0.0 {
+        widths.iter().map(|w| w / norm).collect()
+    } else {
+        widths.to_vec()
+    }
+}
+
+pub fn extract_bboxes_mock(widths: &[f64]) -> Vec<f64> {
+    widths.to_vec()
+}
+
+// ============================================
+// 3D MESH WATERMARKING
+// ============================================
+
+#[derive(Clone, Debug)]
+pub struct Mesh {
+    pub vertices: Vec<[f64; 3]>,
+    pub edges: Vec<(usize, usize)>,
+}
+
+pub fn edge_lengths(mesh: &Mesh) -> Vec<f64> {
+    mesh.edges.iter().map(|(a, b)| {
+        let va = mesh.vertices[*a];
+        let vb = mesh.vertices[*b];
+        ((va[0] - vb[0]).powi(2)
+            + (va[1] - vb[1]).powi(2)
+            + (va[2] - vb[2]).powi(2)).sqrt()
+    }).collect()
+}
+
+pub fn mesh_watermark(signal: &[f64], lattice: &[f64]) -> f64 {
+    phase_invariant_score(signal, lattice)
+}
+
+// ============================================
+// FFT-BASED BLOCK PROCESSING SYSTEM
+// ============================================
+
+pub fn split_into_blocks(signal: &[f64], block_size: usize) -> Vec<&[f64]> {
+    signal
+        .chunks(block_size)
+        .filter(|b| b.len() == block_size)
+        .collect()
+}
+
+pub fn fft_magnitude(block: &[f64]) -> Vec<f64> {
+    use rustfft::{FftPlanner, num_complex::Complex};
+    
+    let mut planner = FftPlanner::new();
+    let fft = planner.plan_fft_forward(block.len());
+
+    let mut buffer: Vec<Complex<f64>> =
+        block.iter().map(|&x| Complex::new(x, 0.0)).collect();
+
+    fft.process(&mut buffer);
+
+    buffer.iter().map(|c| c.norm()).collect()
+}
+
+pub fn block_energy(magnitudes: &[f64]) -> f64 {
+    magnitudes.iter().map(|v| v * v).sum::<f64>().sqrt()
+}
+
+// ============================================
+// MULTI-BASIS WATERMARKING SYSTEM
+// ============================================
+
+#[derive(Clone, Debug)]
+pub struct Basis {
+    pub lattice: Vec<f64>,
+    pub weight: f64,
+}
+
+pub fn project(signal: &[f64], lattice: &[f64]) -> Vec<f64> {
+    signal.iter()
+        .zip(lattice)
+        .map(|(s, l)| s * l)
+        .collect()
+}
+
+pub fn score_block_multi_basis(
+    block: &[f64],
+    bases: &[Basis],
+) -> f64 {
+    bases.iter().map(|b| {
+        let projected = project(block, &b.lattice);
+        let mag = fft_magnitude(&projected);
+        b.weight * block_energy(&mag)
+    }).sum()
+}
+
+pub fn invariant_signature_score(
+    signal: &[f64],
+    bases: &[Basis],
+    block_size: usize,
+) -> f64 {
+    let blocks = split_into_blocks(signal, block_size);
+
+    let scores: Vec<f64> = blocks.iter()
+        .map(|b| score_block_multi_basis(b, bases))
+        .collect();
+
+    // Median is robust to outliers and attacks
+    if scores.is_empty() {
+        return 0.0;
+    }
+    
+    let mut sorted = scores.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted[sorted.len() / 2]
 }
 
 // ============================================
@@ -244,7 +543,7 @@ pub fn find_candidates(
         }
     }
 
-    out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     out
 }
 
@@ -348,6 +647,6 @@ fn main() {
     let glyphs = build_glyph_widths(&face, 16.0);
     eprintln!(" Glyps loaded: {} symbols\n", glyphs.len());
 
-    // Запуск всех тестов
-    tests::run_all_tests(&face, &glyphs);
+    // Run extended tests with advanced watermarks
+    tests::run_all_tests_with_advanced_watermarks(&face, &glyphs);
 }
